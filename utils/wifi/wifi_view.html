@@ -76,9 +76,14 @@
                     <th>Сигнал</th>
                 </tr>
             </thead>
-            <tbody id="wifi-log-table-body">
-                <tr><td colspan="7" class="text-center text-muted py-4">Считывание файла wifi_records.jsonl...</td></tr>
-            </tbody>
+            
+        <tbody id="wifi-log-table-body">
+            <!-- НАША ИСПРАВЛЕННАЯ СТРОКА: оригинальный JS ищет именно этот id -->
+            <tr id="wifi-log-table-loading">
+                <td colspan="7" class="text-center text-muted py-4">Считывание файла wifi_records.jsonl...</td>
+            </tr>
+        </tbody>
+
         </table>
     </div>
   </div>

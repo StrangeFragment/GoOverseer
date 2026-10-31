@@ -19,12 +19,12 @@ function initWifiChart() {
             labels: [],
             datasets: [{
                 label: 'Уровень сигнала (dBm)',
-                data: [],
+                data: [], // Сюда Chart.js будет складывать точки
                 borderColor: '#0d6efd',
                 backgroundColor: 'rgba(13, 110, 253, 0.05)',
                 borderWidth: 2,
                 pointRadius: 2,
-                tension: 0.2, // Плавное сглаживание
+                tension: 0.2,
                 fill: true
             }]
         },
@@ -47,9 +47,9 @@ function initWifiChart() {
 
 
 function refreshWifiAnalytics() {
-    // Считываем id и СРАЗУ переводим его в нижний регистр ("WIFI" -> "wifi")
+    // 1. Для поиска настроек используем нижний регистр ("wifi")
     const rawId = new URLSearchParams(window.location.search).get('id');
-    const id = rawId ? rawId.toLowerCase() : "wifi";
+    const idForConfig = rawId ? rawId.toLowerCase() : "wifi";
 
     // Отрисовка полей конфигурации
     const fieldsContainer = document.getElementById("wifi-custom-config-fields");
@@ -68,7 +68,7 @@ function refreshWifiAnalytics() {
         fetch(`/api/utils`)
             .then(res => res.json())
             .then(utils => {
-                const wifi = utils.find(u => u.id === id);
+                const wifi = utils.find(u => u.id.toLowerCase() === idForConfig);
                 if (wifi && wifi.settings) {
                     if (wifi.settings.interval_sec) document.getElementById("cfg_live_interval_sec").value = wifi.settings.interval_sec;
                     if (wifi.settings.min_signal_drop_dbm) document.getElementById("cfg_live_min_signal_drop_dbm").value = wifi.settings.min_signal_drop_dbm;
@@ -76,13 +76,13 @@ function refreshWifiAnalytics() {
             });
     }
 
-    // Загрузка логов истории
-    fetch(`/api/utils/logs?id=${id}`)
+    // 2. А ДЛЯ СЧИТЫВАНИЯ ЛОГОВ ИЗ ПАПКИ ОТПРАВЛЯЕМ ЗАГЛАВНЫМИ ("WIFI")
+    const idForLogs = rawId ? rawId.toUpperCase() : "WIFI";
+    fetch(`/api/utils/logs?id=${idForLogs}`)
         .then(res => res.json())
         .then(data => {
             if (data.length > 0) {
                 const latestEntry = data[data.length - 1];
-                // Рендерим, если пришло новое время ИЛИ если это самый первый запуск страницы
                 if (latestEntry.time !== lastRenderedTimestamp || lastRenderedTimestamp === "") {
                     renderAnalytics(data);
                 }
@@ -90,14 +90,13 @@ function refreshWifiAnalytics() {
                 renderAnalytics([]);
             }
         });
-
 }
 
 function renderAnalytics(data) {
     const tableBody = document.getElementById("wifi-log-table-body");
     if (!tableBody || !wifiChartInstance) return;
     
-    // === АБСОЛЮТНО БЕЗОПАСНОЕ ОБНОВЛЕНИЕ КАРТОЧЕК ===
+    // === БЕЗОПАСНОЕ ОБНОВЛЕНИЕ КАРТОЧЕК ЭКСПРЕСС-АНАЛИТИКИ ===
     if (data && data.length > 0) {
         const latestEntry = data[data.length - 1];
         
@@ -112,7 +111,7 @@ function renderAnalytics(data) {
         
         if (elSignal) {
             elSignal.innerText = `${latestEntry.signal ?? -100} dBm`;
-            elSignal.className = "mb-0 fw-bold"; // Сброс
+            elSignal.className = "mb-0 fw-bold"; 
             if (latestEntry.ssid === "Disconnected") {
                 elSignal.classList.add("text-danger");
             } else if (latestEntry.signal >= -65) {
@@ -122,8 +121,6 @@ function renderAnalytics(data) {
             }
         }
     }
-    // ===============================================
-
 
     tableBody.innerHTML = "";
 
@@ -136,15 +133,18 @@ function renderAnalytics(data) {
     wifiChartInstance.data.labels = [];
     wifiChartInstance.data.datasets[0].data = [];
 
-    // Берем последние 40 точек для вывода на график, чтобы не сжимать шкалу
     const chartPoints = data.slice(-40);
     chartPoints.forEach(entry => {
-        wifiChartInstance.data.labels.push(entry.time.split(" ")[1]); // Только ЧЧ:ММ:СС
+        let labelTime = "—";
+        if (entry.time) {
+            labelTime = entry.time.includes(" ") ? entry.time.split(" ")[1] : entry.time;
+        }
+        wifiChartInstance.data.labels.push(labelTime);
         wifiChartInstance.data.datasets[0].data.push(entry.signal);
     });
     wifiChartInstance.update();
 
-    // Б. ЗАПОЛНЯЕМ ТАБЛИЦУ (Свежие строки наверх)
+    // Б. ЗАПОЛНЯЕМ ТАБЛИЦУ
     const reversedData = [...data].reverse();
     reversedData.forEach(entry => {
         let rowClass = entry.ssid === "Disconnected" ? "table-danger" : (entry.signal >= -65 ? "table-success" : "table-warning");
@@ -165,6 +165,7 @@ function renderAnalytics(data) {
     lastRenderedTimestamp = data[data.length - 1].time;
 }
 
+// ДЛЯ СОХРАНЕНИЯ НАСТРОЕК
 function saveWifiSettings() {
     const id = new URLSearchParams(window.location.search).get('id');
     const newSettings = {
@@ -179,4 +180,15 @@ function saveWifiSettings() {
     }).then(res => {
         if (res.ok) { alert("Конфигурация успешно сохранена!"); refreshWifiAnalytics(); }
     });
+}
+
+// ДЛЯ КНОПКИ ВЫГРУЗКИ из ДЕМОНОВ:
+function shutdownServer() {
+        if (confirm("Вы уверены, что хотите полностью остановить оркестратор и закрыть сервер?")) {
+            fetch('/api/shutdown', { method: 'POST' })
+                .then(() => {
+                    alert("Оркестратор остановлен. Окно можно закрыть.");
+                    window.close();
+            });
+}
 }

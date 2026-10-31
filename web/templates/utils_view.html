@@ -16,9 +16,9 @@
                 <img src="/static/assets/overseer.png" alt="Logo" width="30" height="30" class="d-inline-block align-text-top me-2">
                 <strong>GoOverseer</strong>
             </a>
-             <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-                <span class="navbar-text">
-                    <b>{{.Name}}.</b>&nbsp;{{.Description}}
+            <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+                <span class="navbar-text text-light fs-5 fw-bold p-0">
+                    {{if .Utility}}{{.Utility.Name}}{{else if .Title}}{{.Title}}{{else}}Мониторинг Wi-Fi{{end}}
                 </span>
              </ul>
             <button onclick="shutdownServer()" class="btn btn-outline-danger btn-sm">
