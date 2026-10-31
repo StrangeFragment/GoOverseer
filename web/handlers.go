@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/windows/registry"
 )
@@ -125,25 +127,29 @@ func copyFile(src, dst string) error {
 func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// НАДЕЖНЫЙ СТАТИК-ОБРАБОТЧИК: Исправляет MIME-типы под Windows раз и навсегда
+	// Статический файловый сервер
 	staticFS := GetStaticFS()
 	fileServer := http.FileServer(http.FS(staticFS))
 
 	mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
-		filePath := r.URL.Path
+		ext := strings.ToLower(path.Ext(r.URL.Path))
 
-		// Перехватываем заголовки и выставляем их вручную ПЕРЕД вызовом сервера
-		if strings.HasSuffix(filePath, ".js") {
+		switch ext {
+		case ".js":
 			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		} else if strings.HasSuffix(filePath, ".css") {
+		case ".css":
 			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-		} else if strings.HasSuffix(filePath, ".png") {
+		case ".png":
 			w.Header().Set("Content-Type", "image/png")
+		case ".svg":
+			w.Header().Set("Content-Type", "image/svg+xml")
+		case ".ico":
+			w.Header().Set("Content-Type", "image/x-icon")
+		case ".json":
+			w.Header().Set("Content-Type", "application/json")
 		}
 
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-
-		// Отдаем файл
 		http.StripPrefix("/static/", fileServer).ServeHTTP(w, r)
 	})
 
@@ -182,7 +188,7 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		utilsList, _ := ScanUtils()
 		var target *UtilityInfo
 		for i := range utilsList {
-			if utilsList[i].ID == id {
+			if strings.EqualFold(utilsList[i].ID, id) {
 				target = &utilsList[i]
 				break
 			}
@@ -236,7 +242,7 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		utilsList, _ := ScanUtils()
 		var target *UtilityInfo
 		for i := range utilsList {
-			if utilsList[i].ID == id {
+			if strings.EqualFold(utilsList[i].ID, id) {
 				target = &utilsList[i]
 				break
 			}
@@ -247,17 +253,26 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 			return
 		}
 
+		// Завершаем процесс демона
 		_ = exec.Command("taskkill", "/F", "/IM", target.ExeName).Run()
 
+		// Удаляем ключ из автозагрузки Windows
 		k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 		if err == nil {
 			_ = k.DeleteValue("GoOverseer_" + target.ID)
 			k.Close()
 		}
 
+		// Очищаем директорию с паузой для снятия файловой блокировки Windows
 		appDataDir, _ := os.UserConfigDir()
 		liveDir := filepath.Join(appDataDir, "GoOverseer", target.ID)
-		_ = os.RemoveAll(liveDir)
+
+		for attempt := 0; attempt < 3; attempt++ {
+			time.Sleep(150 * time.Millisecond)
+			if err := os.RemoveAll(liveDir); err == nil {
+				break
+			}
+		}
 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Deactivated successfully"))
@@ -311,7 +326,7 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		utilsList, _ := ScanUtils()
 		var target *UtilityInfo
 		for i := range utilsList {
-			if utilsList[i].ID == id {
+			if strings.EqualFold(utilsList[i].ID, id) {
 				target = &utilsList[i]
 				break
 			}
@@ -349,6 +364,7 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		_ = baseTmpl.Execute(w, data)
 	})
 
+	// Считывание логов телеметрии
 	mux.HandleFunc("GET /api/utils/logs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		id := r.URL.Query().Get("id")
@@ -360,7 +376,7 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		utilsList, _ := ScanUtils()
 		var target *UtilityInfo
 		for i := range utilsList {
-			if utilsList[i].ID == id {
+			if strings.EqualFold(utilsList[i].ID, id) {
 				target = &utilsList[i]
 				break
 			}
@@ -374,26 +390,45 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		appDataDir, _ := os.UserConfigDir()
 		logFilePath := filepath.Join(appDataDir, "GoOverseer", target.ID, target.LogFile)
 
-		file, err := os.ReadFile(logFilePath)
+		fileInfo, err := os.Stat(logFilePath)
 		if err != nil {
 			_, _ = w.Write([]byte("[]"))
 			return
 		}
-		lines := strings.Split(string(file), "\n")
+
+		// Если файл очень большой, читаем только хвост (последние 256 КБ)
+		var fileBytes []byte
+		if fileInfo.Size() > 256*1024 {
+			f, err := os.Open(logFilePath)
+			if err == nil {
+				_, _ = f.Seek(-256*1024, io.SeekEnd)
+				fileBytes, _ = io.ReadAll(f)
+				f.Close()
+			}
+		} else {
+			fileBytes, _ = os.ReadFile(logFilePath)
+		}
+
+		lines := strings.Split(string(fileBytes), "\n")
 		var validJSONLines []string
+
 		for _, line := range lines {
 			trimmed := strings.TrimSpace(line)
-			if trimmed != "" {
+			if trimmed != "" && json.Valid([]byte(trimmed)) {
 				validJSONLines = append(validJSONLines, trimmed)
 			}
 		}
-		if len(validJSONLines) > 300 {
-			validJSONLines = validJSONLines[len(validJSONLines)-300:]
+
+		// Ограничиваем выдачу последними 500 записями
+		if len(validJSONLines) > 500 {
+			validJSONLines = validJSONLines[len(validJSONLines)-500:]
 		}
+
 		responseJSON := "[" + strings.Join(validJSONLines, ",") + "]"
 		_, _ = w.Write([]byte(responseJSON))
 	})
-	// Роут для скриптов аналитики со склада
+
+	// Роут для скриптов аналитики
 	mux.HandleFunc("GET /static/js/utils/", func(w http.ResponseWriter, r *http.Request) {
 		pathParts := strings.Split(r.URL.Path, "/")
 		if len(pathParts) == 0 {
@@ -423,5 +458,6 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		_, _ = w.Write([]byte("Stopping..."))
 		go shutdownCtxCancel()
 	})
+
 	return mux
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +16,7 @@ import (
 	"golang.org/x/text/encoding/charmap"
 )
 
-// Наша расширенная структура данных (строго по ТЗ)
+// Расширенная структура данных Wi-Fi телеметрии
 type WifiData struct {
 	Time      string `json:"time"`
 	Interface string `json:"interface"`
@@ -29,22 +30,21 @@ type WifiData struct {
 	State     string `json:"state"`
 }
 
-// Простая структура для чтения интервала
+// Структура конфигурации демона
 type Config struct {
-	IntervalSec string `json:"interval_sec"`
+	IntervalSec      string `json:"interval_sec"`
+	MinSignalDropDbm string `json:"min_signal_drop_dbm"`
 }
 
 func main() {
-	// 1. Определяем рабочую директорию демона.
-	// Так как он запускается из автозагрузки, os.Getwd() вернет C:\Windows\System32.
-	// Поэтому мы явно вычисляем путь к папке, где лежит сам исполняемый файл в %APPDATA%
+	// 1. Вычисляем путь к рабочей директории демона в %APPDATA%\GoOverseer\WIFI
 	exePath, err := os.Executable()
 	if err != nil {
 		os.Exit(1)
 	}
 	workDir := filepath.Dir(exePath)
 
-	// Настраиваем системный логгер демона для отладки ошибок
+	// Настраиваем системный логгер демона для отладки
 	logFile, _ := os.OpenFile(filepath.Join(workDir, "wifi_daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if logFile != nil {
 		log.SetOutput(logFile)
@@ -54,9 +54,16 @@ func main() {
 	configPath := filepath.Join(workDir, "config.json")
 	recordsPath := filepath.Join(workDir, "wifi_records.jsonl")
 
+	var lastSignal int32 = -999
+	var lastSSID string = ""
+	var lastState string = ""
+	var lastRecordTime time.Time
+
 	for {
-		// 2. Читаем актуальные настройки из config.json на каждом шаге цикла
-		interval := 5 // дефолтное значение
+		// 2. Читаем актуальные настройки из config.json
+		interval := 5
+		minDropDbm := 0
+
 		cfgData, err := os.ReadFile(configPath)
 		if err == nil {
 			var cfg Config
@@ -64,28 +71,62 @@ func main() {
 				if val, err := strconv.Atoi(cfg.IntervalSec); err == nil && val > 0 {
 					interval = val
 				}
+				if val, err := strconv.Atoi(cfg.MinSignalDropDbm); err == nil && val > 0 {
+					minDropDbm = val
+				}
 			}
 		}
 
-		// 3. Собираем расширенные данные Wi-Fi
+		// 3. Считываем данные Wi-Fi адаптера через netsh
 		currentData := parseWindowsWifi()
 
-		// 4. Записываем в текстовый jsonl-файл
-		jsonData, err := json.Marshal(currentData)
-		if err == nil {
-			f, err := os.OpenFile(recordsPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-			if err == nil {
-				_, _ = io.WriteString(f, string(jsonData)+"\n")
-				f.Close()
+		// 4. Проверяем условие логирования:
+		// Если порог minDropDbm задан, пишем при изменении сигнала >= порога,
+		// при смене сети/состояния или принудительно раз в 30 секунд (heartbeat для живого графика)
+		shouldWrite := true
+		if minDropDbm > 0 && lastSignal != -999 {
+			diff := int(math.Abs(float64(currentData.Signal - lastSignal)))
+			stateChanged := currentData.SSID != lastSSID || currentData.State != lastState
+			heartbeatExpired := time.Since(lastRecordTime) >= 30*time.Second
+
+			if diff < minDropDbm && !stateChanged && !heartbeatExpired {
+				shouldWrite = false
 			}
 		}
 
-		// Спим столько секунд, сколько указано в конфиге
+		if shouldWrite {
+			jsonData, err := json.Marshal(currentData)
+			if err == nil {
+				f, err := os.OpenFile(recordsPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+				if err == nil {
+					_, _ = io.WriteString(f, string(jsonData)+"\n")
+					f.Close()
+				}
+			}
+			lastSignal = currentData.Signal
+			lastSSID = currentData.SSID
+			lastState = currentData.State
+			lastRecordTime = time.Now()
+		}
+
 		time.Sleep(time.Duration(interval) * time.Second)
 	}
 }
 
-// Наш надежный парсер netsh без кракозябр
+// Парсинг дробных скоростей (например, "866.7" Мбит/с или "144,4")
+func parseRate(val string) int32 {
+	val = strings.TrimSpace(val)
+	val = strings.ReplaceAll(val, ",", ".")
+	if f, err := strconv.ParseFloat(val, 64); err == nil {
+		return int32(math.Round(f))
+	}
+	if i, err := strconv.Atoi(val); err == nil {
+		return int32(i)
+	}
+	return 0
+}
+
+// Парсер netsh wlan show interfaces
 func parseWindowsWifi() WifiData {
 	res := WifiData{
 		Time:      time.Now().Format("2006-01-02 15:04:05"),
@@ -101,8 +142,6 @@ func parseWindowsWifi() WifiData {
 	}
 
 	cmd := exec.Command("netsh", "wlan", "show", "interfaces")
-
-	// ИСПРАВЛЕНО: ЖЕСТКО ЗАПРЕЩАЕМ WINDOWS ПОКАЗЫВАТЬ ОКНО КОНСОЛИ ДЛЯ NETSH
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow: true,
 	}
@@ -112,9 +151,17 @@ func parseWindowsWifi() WifiData {
 		return res
 	}
 
+	// Декодируем OEM CP866 вывод Windows консоли
 	decoder := charmap.CodePage866.NewDecoder()
-	utf8Bytes, _ := decoder.Bytes(out)
-	lines := strings.Split(string(utf8Bytes), "\n")
+	utf8Bytes, err := decoder.Bytes(out)
+	var rawStr string
+	if err == nil {
+		rawStr = string(utf8Bytes)
+	} else {
+		rawStr = string(out)
+	}
+
+	lines := strings.Split(rawStr, "\n")
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -139,12 +186,10 @@ func parseWindowsWifi() WifiData {
 		case key == "Канал" || key == "Channel":
 			ch, _ := strconv.Atoi(val)
 			res.Channel = int32(ch)
-		case key == "Прием (Мбит/с)" || key == "Receive rate (Mbps)":
-			rate, _ := strconv.Atoi(val)
-			res.RxRate = int32(rate)
-		case key == "Передача (Мбит/с)" || key == "Transmit rate (Mbps)":
-			rate, _ := strconv.Atoi(val)
-			res.TxRate = int32(rate)
+		case strings.Contains(key, "Прием") || strings.Contains(key, "Receive rate"):
+			res.RxRate = parseRate(val)
+		case strings.Contains(key, "Передача") || strings.Contains(key, "Transmit rate"):
+			res.TxRate = parseRate(val)
 		case key == "Сигнал" || key == "Signal":
 			val = strings.TrimSuffix(val, "%")
 			pct, _ := strconv.Atoi(val)

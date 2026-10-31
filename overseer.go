@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
-	"path/filepath" // Необходим для сборки путей к файлам
+	"path/filepath"
 	"syscall"
 	"unsafe"
 
@@ -39,6 +40,16 @@ func tryCaptureMutexForPort(port int) (syscall.Handle, bool) {
 	}
 
 	return hMutex, true
+}
+
+// Проверяет фактическую доступность TCP порта
+func isTCPPortAvailable(port int) bool {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
 }
 
 // Инициализирует и проверяет рабочую папку в %APPDATA%
@@ -79,7 +90,6 @@ func initAppData() (string, error) {
 func main() {
 	log.Println("Инициализация окружения GoOverseer...")
 
-	// Вызываем проверку папки AppData при старте программы
 	appDataPath, err := initAppData()
 	if err != nil {
 		log.Fatalf("Критическая ошибка инициализации системы: %v", err)
@@ -90,32 +100,31 @@ func main() {
 	var runningPort int = 0
 	var isFirstInstance bool = false
 
-	// ЗАЩИТА ПРИ СТАРТЕ: Сканируем мутексы Windows, чтобы найти живую первую копию
+	// ЗАЩИТА ПРИ СТАРТЕ: Сканируем диапазон портов и мутексов
 	for port := 8080; port <= 8090; port++ {
 		hMutex, success := tryCaptureMutexForPort(port)
 		if !success {
+			// Мутекс уже захвачен другой копией GoOverseer
 			runningPort = port
 			break
 		}
 
-		if port == 8080 && success {
-			activeHandle = hMutex
-			runningPort = port
-			isFirstInstance = true
-			break
+		// Мутекс свободен. Проверяем также доступность TCP сокета
+		if !isTCPPortAvailable(port) {
+			_ = syscall.CloseHandle(hMutex)
+			continue
 		}
 
-		if success {
-			activeHandle = hMutex
-			runningPort = port
-			isFirstInstance = true
-			break
-		}
+		activeHandle = hMutex
+		runningPort = port
+		isFirstInstance = true
+		break
 	}
 
-	// Если мы ВТОРАЯ копия — просто тихо закрываемся
+	// Если мы ВТОРАЯ копия — открываем браузер или выходим
 	if !isFirstInstance && runningPort > 0 {
-		log.Printf("GoOverseer уже запущен на порту %d. Завершение работы копии.", runningPort)
+		log.Printf("GoOverseer уже запущен на порту %d. Открытие панели в браузере и завершение копии.", runningPort)
+		tray.OpenBrowserInWindows(fmt.Sprintf("http://127.0.0.1:%d", runningPort))
 		os.Exit(0)
 	}
 
@@ -125,7 +134,6 @@ func main() {
 		}
 	}()
 
-	// МЫ ПЕРВАЯ КОПИЯ — продолжаем штатный запуск сервера строго на найденном свободном порту
 	mainCtx, cancelAll := context.WithCancel(context.Background())
 	defer cancelAll()
 
@@ -137,7 +145,7 @@ func main() {
 		log.Fatalf("Ошибка инициализации сервера: %v", err)
 	}
 
-	// Достаем байты иконки из встроенной статики
+	// Иконка трея
 	staticFS := web.GetStaticFS()
 	iconFile, err := staticFS.Open("assets/overseer.png")
 	var iconBytes []byte
@@ -148,7 +156,6 @@ func main() {
 		iconFile.Close()
 	}
 
-	// Настраиваем и запускаем системный трей
 	t := tray.InitTray(serverURL, iconBytes, cancelAll)
 
 	// Системные прерывания (Ctrl+C)

@@ -1,163 +1,399 @@
+// ==========================================================================
+// GoOverseer Wi-Fi Telemetry & Analytics Logic
+// ==========================================================================
+
 let wifiChartInstance = null;
 let lastRenderedTimestamp = "";
+let cachedLogData = [];
+let currentPointsLimit = 30;
+let isPaused = false;
+let currentLogFilter = 'all';
+let searchQuery = '';
 
-// Стартуем опрос при загрузке страницы
 document.addEventListener("DOMContentLoaded", () => {
     initWifiChart();
     refreshWifiAnalytics();
-    // Проверяем обновления каждые 3 секунды
-    setInterval(refreshWifiAnalytics, 3000);
+
+    // Периодический опрос каждые 3 секунды
+    setInterval(() => {
+        if (!isPaused) {
+            refreshWifiAnalytics();
+        }
+    }, 3000);
 });
 
+// Инициализация Chart.js графика радиоэфира
 function initWifiChart() {
     const ctx = document.getElementById('wifiSignalChart');
-    if (!ctx || typeof Chart === 'undefined') return;
+    if (!ctx) return;
 
-    wifiChartInstance = new Chart(ctx.getContext('2d'), {
+    if (typeof Chart === 'undefined') {
+        console.warn("Chart.js библиотека еще не загружена или не найдена");
+        return;
+    }
+
+    const canvasCtx = ctx.getContext('2d');
+    const gradient = canvasCtx.createLinearGradient(0, 0, 0, 350);
+    gradient.addColorStop(0, 'rgba(6, 182, 212, 0.35)');
+    gradient.addColorStop(1, 'rgba(6, 182, 212, 0.0)');
+
+    wifiChartInstance = new Chart(canvasCtx, {
         type: 'line',
         data: {
             labels: [],
             datasets: [{
-                label: 'Уровень сигнала (dBm)',
-                data: [], // Сюда Chart.js будет складывать точки
-                borderColor: '#0d6efd',
-                backgroundColor: 'rgba(13, 110, 253, 0.05)',
-                borderWidth: 2,
+                label: 'Мощность сигнала (dBm)',
+                data: [],
+                borderColor: '#06b6d4',
+                backgroundColor: gradient,
+                borderWidth: 2.5,
                 pointRadius: 2,
-                tension: 0.2,
+                pointHoverRadius: 6,
+                pointBackgroundColor: '#22d3ee',
+                pointBorderColor: '#0b0f19',
+                pointBorderWidth: 2,
+                tension: 0.35,
                 fill: true
             }]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            animation: {
+                duration: 400
+            },
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    backgroundColor: 'rgba(15, 23, 42, 0.95)',
+                    titleColor: '#f8fafc',
+                    bodyColor: '#38bdf8',
+                    borderColor: 'rgba(255, 255, 255, 0.1)',
+                    borderWidth: 1,
+                    padding: 10,
+                    boxPadding: 4,
+                    usePointStyle: true,
+                    callbacks: {
+                        label: function(context) {
+                            const val = context.parsed.y;
+                            let quality = "Отличное";
+                            if (val < -80) quality = "Очень слабое";
+                            else if (val < -70) quality = "Удовлетворительное";
+                            else if (val < -60) quality = "Хорошее";
+                            return ` Сигнал: ${val} dBm (${quality})`;
+                        }
+                    }
+                }
+            },
             scales: {
-                y: { 
-                    min: -100, 
+                y: {
+                    min: -100,
                     max: -30,
-                    title: { display: true, text: 'dBm (ближе к 0 — лучше)' }
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.05)'
+                    },
+                    ticks: {
+                        color: '#94a3b8',
+                        stepSize: 10,
+                        callback: function(value) {
+                            return value + ' dBm';
+                        }
+                    },
+                    title: {
+                        display: true,
+                        text: 'Уровень сигнала (dBm)',
+                        color: '#64748b',
+                        font: { size: 11, weight: 'bold' }
+                    }
                 },
                 x: {
-                    title: { display: true, text: 'Время замеров' }
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.04)'
+                    },
+                    ticks: {
+                        color: '#94a3b8',
+                        maxRotation: 0,
+                        autoSkip: true,
+                        maxTicksLimit: 12
+                    },
+                    title: {
+                        display: true,
+                        text: 'Время замеров',
+                        color: '#64748b',
+                        font: { size: 11, weight: 'bold' }
+                    }
                 }
             }
         }
     });
 }
 
-
 function refreshWifiAnalytics() {
-    // 1. Для поиска настроек используем нижний регистр ("wifi")
-    const rawId = new URLSearchParams(window.location.search).get('id');
-    const idForConfig = rawId ? rawId.toLowerCase() : "wifi";
+    const rawId = new URLSearchParams(window.location.search).get('id') || "WIFI";
 
-    // Отрисовка полей конфигурации
+    // Подгрузка полей конфигурации при первом открытии
     const fieldsContainer = document.getElementById("wifi-custom-config-fields");
     if (fieldsContainer && fieldsContainer.children.length === 0) {
         fieldsContainer.innerHTML = `
-            <div class="mb-3 col-md-6">
+            <div class="col-md-6">
                 <label class="form-label text-light small fw-bold">Интервал опроса адаптера (сек)</label>
-                <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" id="cfg_live_interval_sec" value="5">
+                <div class="input-group input-group-sm">
+                    <input type="number" min="1" max="300" class="form-control bg-dark text-light border-secondary" id="cfg_live_interval_sec" value="5">
+                    <span class="input-group-text bg-dark text-muted border-secondary">сек</span>
+                </div>
+                <div class="form-text text-muted small">Частота считывания данных netsh в фоновом режиме.</div>
             </div>
-            <div class="mb-3 col-md-6">
+            <div class="col-md-6">
                 <label class="form-label text-light small fw-bold">Порог фиксации изменения сигнала (dBm)</label>
-                <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" id="cfg_live_min_signal_drop_dbm" value="5">
+                <div class="input-group input-group-sm">
+                    <input type="number" min="0" max="50" class="form-control bg-dark text-light border-secondary" id="cfg_live_min_signal_drop_dbm" value="5">
+                    <span class="input-group-text bg-dark text-muted border-secondary">dBm</span>
+                </div>
+                <div class="form-text text-muted small">Минимальное колебание сигнала для внеочередной записи.</div>
             </div>
         `;
-        
+
         fetch(`/api/utils`)
             .then(res => res.json())
             .then(utils => {
-                const wifi = utils.find(u => u.id.toLowerCase() === idForConfig);
+                const wifi = utils.find(u => u.id.toLowerCase() === rawId.toLowerCase());
                 if (wifi && wifi.settings) {
                     if (wifi.settings.interval_sec) document.getElementById("cfg_live_interval_sec").value = wifi.settings.interval_sec;
                     if (wifi.settings.min_signal_drop_dbm) document.getElementById("cfg_live_min_signal_drop_dbm").value = wifi.settings.min_signal_drop_dbm;
                 }
-            });
+            })
+            .catch(() => {});
     }
 
-    // 2. А ДЛЯ СЧИТЫВАНИЯ ЛОГОВ ИЗ ПАПКИ ОТПРАВЛЯЕМ ЗАГЛАВНЫМИ ("WIFI")
-    const idForLogs = rawId ? rawId.toUpperCase() : "WIFI";
-    fetch(`/api/utils/logs?id=${idForLogs}`)
+    // Запрос логов телеметрии
+    fetch(`/api/utils/logs?id=${encodeURIComponent(rawId.toUpperCase())}`)
         .then(res => res.json())
         .then(data => {
-            if (data.length > 0) {
-                const latestEntry = data[data.length - 1];
-                if (latestEntry.time !== lastRenderedTimestamp || lastRenderedTimestamp === "") {
-                    renderAnalytics(data);
-                }
-            } else {
-                renderAnalytics([]);
+            if (Array.isArray(data)) {
+                cachedLogData = data;
+                renderAnalytics(data);
             }
+        })
+        .catch(err => {
+            console.error("Ошибка получения логов:", err);
+            renderAnalytics(cachedLogData);
         });
 }
 
+// Отрисовка аналитики
 function renderAnalytics(data) {
     const tableBody = document.getElementById("wifi-log-table-body");
-    if (!tableBody || !wifiChartInstance) return;
-    
-    // === БЕЗОПАСНОЕ ОБНОВЛЕНИЕ КАРТОЧЕК ЭКСПРЕСС-АНАЛИТИКИ ===
+
+    // Если график еще не был проинициализирован (например, Chart.js догрузился позже)
+    if (!wifiChartInstance && typeof Chart !== 'undefined') {
+        initWifiChart();
+    }
+
+    // 1. ОБНОВЛЕНИЕ КАРТОЧЕК ЭКСПРЕСС-АНАЛИТИКИ
     if (data && data.length > 0) {
-        const latestEntry = data[data.length - 1];
-        
+        const latest = data[data.length - 1];
+
         const elSsid = document.getElementById("card-ssid");
         const elBssid = document.getElementById("card-bssid");
         const elChannel = document.getElementById("card-channel");
         const elSignal = document.getElementById("card-signal");
+        const elSpeeds = document.getElementById("card-speeds");
+        const elStandard = document.getElementById("card-standard");
+        const elInterface = document.getElementById("card-interface");
+        const elBand = document.getElementById("card-frequency-band");
+        const elQuality = document.getElementById("card-signal-quality");
+        const elBadge = document.getElementById("badge-connection-state");
+        const visualBars = document.getElementById("wifi-visual-bars");
 
-        if (elSsid) elSsid.innerText = latestEntry.ssid || "Disconnected";
-        if (elBssid) elBssid.innerText = latestEntry.bssid || "—";
-        if (elChannel) elChannel.innerText = latestEntry.channel ?? "—";
-        
-        if (elSignal) {
-            elSignal.innerText = `${latestEntry.signal ?? -100} dBm`;
-            elSignal.className = "mb-0 fw-bold"; 
-            if (latestEntry.ssid === "Disconnected") {
-                elSignal.classList.add("text-danger");
-            } else if (latestEntry.signal >= -65) {
-                elSignal.classList.add("text-success");
+        const isDisconnected = !latest.ssid || latest.ssid === "Disconnected" || latest.state === "отключено";
+
+        if (elSsid) elSsid.innerText = isDisconnected ? "Отключено" : latest.ssid;
+        if (elBssid) elBssid.innerText = latest.bssid || "—";
+        if (elChannel) elChannel.innerText = latest.channel > 0 ? latest.channel : "—";
+        if (elInterface) elInterface.innerText = latest.interface || "Wi-Fi";
+        if (elStandard) elStandard.innerText = `Стандарт: ${latest.standard || '—'}`;
+
+        // Определение диапазона частот
+        if (elBand) {
+            if (latest.channel >= 1 && latest.channel <= 14) {
+                elBand.innerText = "2.4 ГГц";
+                elBand.className = "badge bg-info-subtle text-info rounded-pill px-2 py-1";
+            } else if (latest.channel >= 32 && latest.channel <= 177) {
+                elBand.innerText = "5 ГГц";
+                elBand.className = "badge bg-primary-subtle text-primary rounded-pill px-2 py-1";
+            } else if (latest.channel > 177) {
+                elBand.innerText = "6 ГГц";
+                elBand.className = "badge bg-purple-subtle text-purple rounded-pill px-2 py-1";
             } else {
-                elSignal.classList.add("text-warning");
+                elBand.innerText = "—";
+            }
+        }
+
+        // Скорости соединения
+        if (elSpeeds) {
+            const rx = latest.rx_rate || 0;
+            const tx = latest.tx_rate || 0;
+            elSpeeds.innerText = `Линк: ⬇ ${rx} Мб / ⬆ ${tx} Мб`;
+        }
+
+        // Сигнал и индикатор качества
+        const sig = latest.signal ?? -100;
+        if (elSignal) {
+            elSignal.innerText = `${sig} dBm`;
+            elSignal.className = "mb-1 fw-bold text-white";
+        }
+
+        // Качество и 4 полоски
+        let qualityPercent = Math.min(100, Math.max(0, (sig + 100) * 2));
+        let qualityText = "Отличное";
+        let barLevel = "signal-level-4";
+
+        if (isDisconnected || sig <= -95) {
+            qualityText = "Нет связи";
+            barLevel = "signal-level-1";
+        } else if (sig <= -80) {
+            qualityText = "Слабый сигнал";
+            barLevel = "signal-level-1";
+        } else if (sig <= -70) {
+            qualityText = "Удовлетворительное";
+            barLevel = "signal-level-2";
+        } else if (sig <= -60) {
+            qualityText = "Хорошее качество";
+            barLevel = "signal-level-3";
+        }
+
+        if (elQuality) {
+            elQuality.innerText = `${qualityText} (${qualityPercent}%)`;
+        }
+
+        if (visualBars) {
+            visualBars.className = `wifi-signal-bars ${barLevel}`;
+        }
+
+        if (elBadge) {
+            if (isDisconnected) {
+                elBadge.className = "badge badge-custom badge-disconnected";
+                elBadge.innerText = "Отключено";
+            } else {
+                elBadge.className = "badge badge-custom badge-connected";
+                elBadge.innerText = "Связь активна";
             }
         }
     }
 
-    tableBody.innerHTML = "";
+    // 2. ОБНОВЛЕНИЕ ГРАФИКА CHART.JS
+    if (wifiChartInstance && data && data.length > 0) {
+        let chartData = data;
+        if (currentPointsLimit > 0 && data.length > currentPointsLimit) {
+            chartData = data.slice(-currentPointsLimit);
+        }
 
-    if (data.length === 0) {
-        tableBody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-4">Логи пока пусты...</td></tr>`;
+        const labels = [];
+        const points = [];
+        let minSig = 0;
+        let maxSig = -120;
+        let sumSig = 0;
+
+        chartData.forEach(entry => {
+            let label = "—";
+            if (entry.time) {
+                label = entry.time.includes(" ") ? entry.time.split(" ")[1] : entry.time;
+            }
+            labels.push(label);
+            points.push(entry.signal);
+
+            if (entry.signal > maxSig) maxSig = entry.signal;
+            if (minSig === 0 || entry.signal < minSig) minSig = entry.signal;
+            sumSig += entry.signal;
+        });
+
+        wifiChartInstance.data.labels = labels;
+        wifiChartInstance.data.datasets[0].data = points;
+        wifiChartInstance.update();
+
+        // Обновление полосы статистики
+        const latestSig = points[points.length - 1];
+        const avgSig = Math.round(sumSig / points.length);
+
+        const elStatCurr = document.getElementById("chart-stat-current");
+        const elStatMax = document.getElementById("chart-stat-max");
+        const elStatMin = document.getElementById("chart-stat-min");
+        const elStatAvg = document.getElementById("chart-stat-avg");
+
+        if (elStatCurr) elStatCurr.innerText = `${latestSig} dBm`;
+        if (elStatMax) elStatMax.innerText = `${maxSig} dBm`;
+        if (elStatMin) elStatMin.innerText = `${minSig} dBm`;
+        if (elStatAvg) elStatAvg.innerText = `${avgSig} dBm`;
+    }
+
+    // 3. ОБНОВЛЕНИЕ ТАБЛИЦЫ ИСТОРИИ
+    if (!tableBody) return;
+
+    if (!data || data.length === 0) {
+        tableBody.innerHTML = `<tr><td colspan="8" class="text-center text-muted py-5">История подключений пока пуста...</td></tr>`;
         return;
     }
 
-    // А. ОБНОВЛЯЕМ ГРАФИК CHART.JS
-    wifiChartInstance.data.labels = [];
-    wifiChartInstance.data.datasets[0].data = [];
+    // Применяем фильтры и поиск
+    let filteredData = [...data];
 
-    const chartPoints = data.slice(-40);
-    chartPoints.forEach(entry => {
-        let labelTime = "—";
-        if (entry.time) {
-            labelTime = entry.time.includes(" ") ? entry.time.split(" ")[1] : entry.time;
+    if (currentLogFilter === 'connected') {
+        filteredData = filteredData.filter(d => d.ssid && d.ssid !== "Disconnected" && d.state !== "отключено");
+    } else if (currentLogFilter === 'disconnected') {
+        filteredData = filteredData.filter(d => !d.ssid || d.ssid === "Disconnected" || d.state === "отключено");
+    }
+
+    if (searchQuery.trim() !== '') {
+        const q = searchQuery.toLowerCase();
+        filteredData = filteredData.filter(d =>
+            (d.ssid && d.ssid.toLowerCase().includes(q)) ||
+            (d.bssid && d.bssid.toLowerCase().includes(q)) ||
+            (String(d.channel).includes(q)) ||
+            (d.time && d.time.toLowerCase().includes(q))
+        );
+    }
+
+    const counterEl = document.getElementById("records-counter");
+    if (counterEl) counterEl.innerText = filteredData.length;
+
+    tableBody.innerHTML = "";
+
+    if (filteredData.length === 0) {
+        tableBody.innerHTML = `<tr><td colspan="8" class="text-center text-muted py-4">События по заданному фильтру не найдены.</td></tr>`;
+        return;
+    }
+
+    // Отрисовываем строки таблицы (в обратном порядке - свежие сверху)
+    const reversedData = [...filteredData].reverse();
+    reversedData.forEach((entry, idx) => {
+        const isDisc = !entry.ssid || entry.ssid === "Disconnected" || entry.state === "отключено";
+
+        let statusBadge = `<span class="badge badge-custom badge-connected">Подключено</span>`;
+        let signalClass = "text-success";
+
+        if (isDisc) {
+            statusBadge = `<span class="badge badge-custom badge-disconnected">Отключено</span>`;
+            signalClass = "text-danger";
+        } else if (entry.signal < -75) {
+            signalClass = "text-warning";
         }
-        wifiChartInstance.data.labels.push(labelTime);
-        wifiChartInstance.data.datasets[0].data.push(entry.signal);
-    });
-    wifiChartInstance.update();
 
-    // Б. ЗАПОЛНЯЕМ ТАБЛИЦУ
-    const reversedData = [...data].reverse();
-    reversedData.forEach(entry => {
-        let rowClass = entry.ssid === "Disconnected" ? "table-danger" : (entry.signal >= -65 ? "table-success" : "table-warning");
+        const channelBadge = entry.channel > 0
+            ? `<span class="badge bg-secondary-subtle text-light">${entry.channel}</span>`
+            : `<span class="text-muted">—</span>`;
 
         tableBody.innerHTML += `
-            <tr class="${rowClass}">
-                <td><code>${entry.time}</code></td>
-                <td><strong>${entry.ssid}</strong></td>
-                <td><code>${entry.bssid}</code></td>
-                <td><span class="badge bg-dark">${entry.channel}</span></td>
-                <td><small>${entry.standard}</small></td>
-                <td><small>⬇${entry.rx_rate} / ⬆${entry.tx_rate} Мб</small></td>
-                <td><strong>${entry.signal} dBm</strong></td>
+            <tr>
+                <td><code>${entry.time || '—'}</code></td>
+                <td><strong class="text-white">${entry.ssid || 'Disconnected'}</strong></td>
+                <td><code class="text-secondary">${entry.bssid || '—'}</code></td>
+                <td>${channelBadge}</td>
+                <td><small class="text-muted">${entry.standard || '—'}</small></td>
+                <td><small class="text-muted">⬇${entry.rx_rate || 0} / ⬆${entry.tx_rate || 0} Мб</small></td>
+                <td><strong class="${signalClass}">${entry.signal ?? -100} dBm</strong></td>
+                <td>${statusBadge}</td>
             </tr>
         `;
     });
@@ -165,30 +401,123 @@ function renderAnalytics(data) {
     lastRenderedTimestamp = data[data.length - 1].time;
 }
 
-// ДЛЯ СОХРАНЕНИЯ НАСТРОЕК
+// Управление отображением графика
+function setChartPointsLimit(limit) {
+    currentPointsLimit = limit;
+
+    // Обновляем активный класс на кнопках
+    document.querySelectorAll('[aria-label="Диапазон точек"] button').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    if (event && event.target) {
+        event.target.classList.add('active');
+    }
+
+    renderAnalytics(cachedLogData);
+}
+
+function togglePauseLiveStream() {
+    isPaused = !isPaused;
+    const btnIcon = document.getElementById("pause-icon");
+    if (btnIcon) {
+        btnIcon.innerText = isPaused ? "▶ Возобновить" : "⏸ Пауза";
+    }
+}
+
+// Фильтры и поиск по истории
+function setLogFilter(filter) {
+    currentLogFilter = filter;
+    document.querySelectorAll('#filter-all, #filter-connected, #filter-disconnected').forEach(b => b.classList.remove('active'));
+    const activeBtn = document.getElementById(`filter-${filter}`);
+    if (activeBtn) activeBtn.classList.add('active');
+    renderAnalytics(cachedLogData);
+}
+
+function handleSearchInput() {
+    const input = document.getElementById("wifi-search-input");
+    searchQuery = input ? input.value : "";
+    renderAnalytics(cachedLogData);
+}
+
+// Копирование BSSID в буфер обмена
+function copyBssidToClipboard() {
+    const el = document.getElementById("card-bssid");
+    if (!el || !el.innerText || el.innerText === "—") return;
+
+    navigator.clipboard.writeText(el.innerText).then(() => {
+        if (typeof showToast === 'function') {
+            showToast(`BSSID скопирован: ${el.innerText}`, 'info');
+        } else {
+            alert(`BSSID скопирован: ${el.innerText}`);
+        }
+    });
+}
+
+// Экспорт истории в CSV
+function exportLogsToCSV() {
+    if (!cachedLogData || cachedLogData.length === 0) {
+        alert("Нет данных для экспорта.");
+        return;
+    }
+
+    let csv = "Time,SSID,BSSID,Channel,Standard,RxRate,TxRate,Signal,State\n";
+    cachedLogData.forEach(e => {
+        csv += `"${e.time}","${e.ssid}","${e.bssid}",${e.channel},"${e.standard}",${e.rx_rate},${e.tx_rate},${e.signal},"${e.state}"\n`;
+    });
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `wifi_history_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+// Экспорт истории в JSON
+function exportLogsToJSON() {
+    if (!cachedLogData || cachedLogData.length === 0) {
+        alert("Нет данных для экспорта.");
+        return;
+    }
+
+    const blob = new Blob([JSON.stringify(cachedLogData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `wifi_history_${new Date().toISOString().slice(0, 10)}.json`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+// Сохранение настроек утилиты
 function saveWifiSettings() {
-    const id = new URLSearchParams(window.location.search).get('id');
+    const id = new URLSearchParams(window.location.search).get('id') || "WIFI";
     const newSettings = {
-        interval_sec: document.getElementById("cfg_live_interval_sec").value,
-        min_signal_drop_dbm: document.getElementById("cfg_live_min_signal_drop_dbm").value
+        interval_sec: document.getElementById("cfg_live_interval_sec") ? document.getElementById("cfg_live_interval_sec").value : "5",
+        min_signal_drop_dbm: document.getElementById("cfg_live_min_signal_drop_dbm") ? document.getElementById("cfg_live_min_signal_drop_dbm").value : "5"
     };
 
-    fetch(`/api/utils/save?id=${id}`, {
+    fetch(`/api/utils/save?id=${encodeURIComponent(id)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newSettings)
     }).then(res => {
-        if (res.ok) { alert("Конфигурация успешно сохранена!"); refreshWifiAnalytics(); }
+        if (res.ok) {
+            if (typeof showToast === 'function') {
+                showToast("Конфигурация успешно сохранена и применена на лету!", 'success');
+            } else {
+                alert("Конфигурация успешно сохранена!");
+            }
+            refreshWifiAnalytics();
+        } else {
+            if (typeof showToast === 'function') {
+                showToast("Не удалось сохранить конфигурацию", 'danger');
+            } else {
+                alert("Ошибка сохранения конфигурации");
+            }
+        }
     });
-}
-
-// ДЛЯ КНОПКИ ВЫГРУЗКИ из ДЕМОНОВ:
-function shutdownServer() {
-        if (confirm("Вы уверены, что хотите полностью остановить оркестратор и закрыть сервер?")) {
-            fetch('/api/shutdown', { method: 'POST' })
-                .then(() => {
-                    alert("Оркестратор остановлен. Окно можно закрыть.");
-                    window.close();
-            });
-}
 }
