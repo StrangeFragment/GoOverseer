@@ -1,0 +1,54 @@
+<!-- Навигация по вкладкам Wi-Fi строго по стандарту Bootstrap 5 -->
+<ul class="nav nav-tabs mb-4" id="wifiTab" role="tablist">
+  <li class="nav-item" role="presentation">
+    <button class="nav-link active" id="chart-tab" data-bs-toggle="tab" data-bs-target="#chart-tab-pane" type="button" role="tab" aria-controls="chart-tab-pane" aria-selected="true">График радиоэфира</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="log-tab" data-bs-toggle="tab" data-bs-target="#log-tab-pane" type="button" role="tab" aria-controls="log-tab-pane" aria-selected="false">История подключений</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="config-tab" data-bs-toggle="tab" data-bs-target="#config-tab-pane" type="button" role="tab" aria-controls="config-tab-pane" aria-selected="false">Конфигурация</button>
+  </li>
+</ul>
+
+<!-- Содержимое вкладок -->
+<div class="tab-content" id="wifiTabContent">
+  
+  <!-- 1. Вкладка интерактивного графика сигнала -->
+  <div class="tab-pane fade show active border border-translucent rounded p-4 bg-body-tertiary" id="chart-tab-pane" role="tabpanel" aria-labelledby="chart-tab" tabindex="0">
+    <h5 class="text-primary fw-bold mb-3">Уровень сигнала Wi-Fi (dBm) в реальном времени</h5>
+    <div style="position: relative; width: 100%; height: 350px;">
+        <canvas id="wifiSignalChart"></canvas>
+    </div>
+  </div>
+
+  <!-- 2. Вкладка детальной таблицы логов -->
+  <div class="tab-pane fade border border-translucent rounded p-4 bg-body-tertiary" id="log-tab-pane" role="tabpanel" aria-labelledby="log-tab" tabindex="0">
+    <h5 class="text-primary fw-bold mb-3">Последние зарегистрированные события Wi-Fi радиоэфира</h5>
+    <div class="table-responsive" style="max-height: 450px; overflow-y: auto;">
+        <table class="table table-sm table-hover align-middle m-0">
+            <thead class="table-dark sticky-top">
+                <tr>
+                    <th>Время события</th>
+                    <th>Сеть (SSID)</th>
+                    <th>Точка (BSSID)</th>
+                    <th>Канал</th>
+                    <th>Стандарт</th>
+                    <th>Скорость (Rx/Tx)</th>
+                    <th>Сигнал</th>
+                </tr>
+            </thead>
+            <tbody id="wifi-log-table-body">
+                <tr><td colspan="7" class="text-center text-muted py-4">Считывание файла wifi_records.jsonl...</td></tr>
+            </tbody>
+        </table>
+    </div>
+  </div>
+  
+  <!-- 3. Вкладка настроек параметров утилиты -->
+  <div class="tab-pane fade border border-translucent rounded p-4 bg-body-tertiary" id="config-tab-pane" role="tabpanel" aria-labelledby="config-tab" tabindex="0">
+    <h5 class="text-primary fw-bold mb-3">Настройки параметров демона:</h5>
+    <div id="wifi-custom-config-fields" class="row"></div>
+    <button class="btn btn-primary btn-sm mt-3" onclick="saveWifiSettings()">Сохранить изменения</button>
+  </div>
+</div>
