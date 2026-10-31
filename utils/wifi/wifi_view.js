@@ -1,7 +1,5 @@
 // ==========================================================================
-// GoOverseer Wi-Fi Telemetry & Analytics Logic (Оптимизированная версия)
-// Устранены утечки памяти: пакетный DOM-рендеринг, отключение RAF в Chart.js,
-// ограничение видимых строк таблицы и пауза при неактивной вкладке.
+// GoOverseer Wi-Fi Telemetry, Analytics, Scanner & AP Security Logic
 // ==========================================================================
 
 let wifiChartInstance = null;
@@ -12,17 +10,32 @@ let isPaused = false;
 let currentLogFilter = 'all';
 let searchQuery = '';
 
+let pollTimer = null;
+let pollIntervalMs = 3000;
+let autoPingTimer = null;
+
 document.addEventListener("DOMContentLoaded", () => {
+    // Восстанавливаем сохраненный интервал опроса
+    const savedInterval = localStorage.getItem('wifi_poll_interval');
+    if (savedInterval) {
+        const selectEl = document.getElementById('poll-interval-select');
+        if (selectEl) selectEl.value = savedInterval;
+        pollIntervalMs = parseInt(savedInterval, 10) * 1000;
+        const pollLabel = document.getElementById('chart-poll-label');
+        if (pollLabel) pollLabel.innerText = `каждые ${savedInterval} сек`;
+    }
+
     initWifiChart();
     refreshWifiAnalytics(true);
+    startPollingTimer();
 
-    // Периодический опрос каждые 3 секунды
-    setInterval(() => {
-        // ОПТИМИЗАЦИЯ: Если вкладка браузера свернута или не активна, не тратим память и CPU
-        if (!isPaused && !document.hidden) {
-            refreshWifiAnalytics(false);
-        }
-    }, 3000);
+    // Восстанавливаем фоновый пинг, если был активирован
+    const savedAutoPing = localStorage.getItem('wifi_auto_ping') === 'true';
+    const autoPingToggle = document.getElementById('toggle-auto-ping');
+    if (autoPingToggle && savedAutoPing) {
+        autoPingToggle.checked = true;
+        toggleAutoPing(true);
+    }
 
     // При возвращении на вкладку сразу обновляем данные
     document.addEventListener("visibilitychange", () => {
@@ -30,18 +43,45 @@ document.addEventListener("DOMContentLoaded", () => {
             refreshWifiAnalytics(true);
         }
     });
+
+    // Обработчик переключения на вкладку безопасности
+    const secTabBtn = document.getElementById('security-tab');
+    if (secTabBtn) {
+        secTabBtn.addEventListener('shown.bs.tab', () => {
+            analyzeApRegistryAndSecurity();
+        });
+    }
 });
+
+function startPollingTimer() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+        if (!isPaused && !document.hidden) {
+            refreshWifiAnalytics(false);
+        }
+    }, pollIntervalMs);
+}
+
+// Регулировка частоты обновления графика и телеметрии
+function changePollInterval(secondsStr) {
+    const sec = parseInt(secondsStr, 10) || 3;
+    pollIntervalMs = sec * 1000;
+    localStorage.setItem('wifi_poll_interval', sec);
+
+    const pollLabel = document.getElementById('chart-poll-label');
+    if (pollLabel) pollLabel.innerText = `каждые ${sec} сек`;
+
+    startPollingTimer();
+    if (typeof showToast === 'function') {
+        showToast(`Частота опроса телеметрии установлена: каждые ${sec} сек`, 'info');
+    }
+}
 
 // Инициализация Chart.js графика радиоэфира
 function initWifiChart() {
     const ctx = document.getElementById('wifiSignalChart');
-    if (!ctx) return;
+    if (!ctx || typeof Chart === 'undefined') return;
 
-    if (typeof Chart === 'undefined') {
-        return;
-    }
-
-    // Если экземпляр уже существует, уничтожаем старый во избежание утечки canvas context
     if (wifiChartInstance) {
         wifiChartInstance.destroy();
         wifiChartInstance = null;
@@ -74,13 +114,10 @@ function initWifiChart() {
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            // ОПТИМИЗАЦИЯ: Отключаем ресурсоемкие анимации для потоковой телеметрии
             animation: false,
-            normalized: true, // Chart.js быстрая обработка массивов
+            normalized: true,
             plugins: {
-                legend: {
-                    display: false
-                },
+                legend: { display: false },
                 tooltip: {
                     animation: false,
                     backgroundColor: 'rgba(15, 23, 42, 0.95)',
@@ -107,15 +144,11 @@ function initWifiChart() {
                 y: {
                     min: -100,
                     max: -30,
-                    grid: {
-                        color: 'rgba(255, 255, 255, 0.05)'
-                    },
+                    grid: { color: 'rgba(255, 255, 255, 0.05)' },
                     ticks: {
                         color: '#94a3b8',
                         stepSize: 10,
-                        callback: function(value) {
-                            return value + ' dBm';
-                        }
+                        callback: function(v) { return v + ' dBm'; }
                     },
                     title: {
                         display: true,
@@ -125,9 +158,7 @@ function initWifiChart() {
                     }
                 },
                 x: {
-                    grid: {
-                        color: 'rgba(255, 255, 255, 0.04)'
-                    },
+                    grid: { color: 'rgba(255, 255, 255, 0.04)' },
                     ticks: {
                         color: '#94a3b8',
                         maxRotation: 0,
@@ -146,6 +177,13 @@ function initWifiChart() {
     });
 }
 
+function formatBytes(bytes) {
+    if (!bytes || isNaN(bytes) || bytes <= 0) return "0 КБ";
+    if (bytes < 1024) return bytes + " Б";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " КБ";
+    return (bytes / (1024 * 1024)).toFixed(2) + " МБ";
+}
+
 function refreshWifiAnalytics(forceRender = false) {
     const rawId = new URLSearchParams(window.location.search).get('id') || "WIFI";
 
@@ -153,21 +191,29 @@ function refreshWifiAnalytics(forceRender = false) {
     const fieldsContainer = document.getElementById("wifi-custom-config-fields");
     if (fieldsContainer && fieldsContainer.children.length === 0) {
         fieldsContainer.innerHTML = `
-            <div class="col-md-6">
+            <div class="col-md-4">
                 <label class="form-label text-light small fw-bold">Интервал опроса адаптера (сек)</label>
                 <div class="input-group input-group-sm">
                     <input type="number" min="1" max="300" class="form-control bg-dark text-light border-secondary" id="cfg_live_interval_sec" value="5">
                     <span class="input-group-text bg-dark text-muted border-secondary">сек</span>
                 </div>
-                <div class="form-text text-muted small">Частота считывания данных netsh в фоновом режиме.</div>
+                <div class="form-text text-muted small">Частота считывания netsh в фоновом режиме.</div>
             </div>
-            <div class="col-md-6">
-                <label class="form-label text-light small fw-bold">Порог фиксации изменения сигнала (dBm)</label>
+            <div class="col-md-4">
+                <label class="form-label text-light small fw-bold">Порог фиксации сигнала (dBm)</label>
                 <div class="input-group input-group-sm">
                     <input type="number" min="0" max="50" class="form-control bg-dark text-light border-secondary" id="cfg_live_min_signal_drop_dbm" value="5">
                     <span class="input-group-text bg-dark text-muted border-secondary">dBm</span>
                 </div>
-                <div class="form-text text-muted small">Минимальное колебание сигнала для внеочередной записи.</div>
+                <div class="form-text text-muted small">Минимальное колебание для внеочередной записи.</div>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label text-light small fw-bold">Максимальный размер лога (МБ)</label>
+                <div class="input-group input-group-sm">
+                    <input type="number" min="1" max="100" class="form-control bg-dark text-light border-secondary" id="cfg_live_max_log_mb" value="5">
+                    <span class="input-group-text bg-dark text-muted border-secondary">МБ</span>
+                </div>
+                <div class="form-text text-muted small">При превышении создается резервный .old архив.</div>
             </div>
         `;
 
@@ -178,6 +224,7 @@ function refreshWifiAnalytics(forceRender = false) {
                 if (wifi && wifi.settings) {
                     if (wifi.settings.interval_sec) document.getElementById("cfg_live_interval_sec").value = wifi.settings.interval_sec;
                     if (wifi.settings.min_signal_drop_dbm) document.getElementById("cfg_live_min_signal_drop_dbm").value = wifi.settings.min_signal_drop_dbm;
+                    if (wifi.settings.max_log_mb) document.getElementById("cfg_live_max_log_mb").value = wifi.settings.max_log_mb;
                 }
             })
             .catch(() => {});
@@ -185,16 +232,24 @@ function refreshWifiAnalytics(forceRender = false) {
 
     // Запрос логов телеметрии
     fetch(`/api/utils/logs?id=${encodeURIComponent(rawId.toUpperCase())}`)
-        .then(res => res.json())
+        .then(res => {
+            const sizeHeader = res.headers.get("X-Log-Size-Bytes");
+            if (sizeHeader) {
+                const sizeBadge = document.getElementById("log-size-badge");
+                if (sizeBadge) {
+                    sizeBadge.innerText = formatBytes(parseInt(sizeHeader, 10));
+                }
+            }
+            return res.json();
+        })
         .then(data => {
             if (Array.isArray(data)) {
                 cachedLogData = data;
 
-                // ОПТИМИЗАЦИЯ: Проверяем, появились ли вообще новые данные
                 if (!forceRender && data.length > 0) {
                     const latestTime = data[data.length - 1].time;
                     if (latestTime === lastRenderedTimestamp) {
-                        return; // Новых записей нет — не нагружаем процессор и сборщик мусора
+                        return;
                     }
                 }
 
@@ -331,8 +386,6 @@ function renderAnalytics(data) {
 
         wifiChartInstance.data.labels = labels;
         wifiChartInstance.data.datasets[0].data = points;
-
-        // ОПТИМИЗАЦИЯ: 'none' запрещает запуск цикла requestAnimationFrame
         wifiChartInstance.update('none');
 
         const latestSig = points[points.length - 1];
@@ -357,7 +410,6 @@ function renderAnalytics(data) {
         return;
     }
 
-    // Фильтрация
     let filteredData = data;
 
     if (currentLogFilter === 'connected') {
@@ -384,12 +436,7 @@ function renderAnalytics(data) {
         return;
     }
 
-    // ОПТИМИЗАЦИЯ: Отображаем в DOM не более 60 самых свежих строк (остальное доступно в экспорте)
-    // Это исключает перегрузку браузера десятками тысяч DOM-узлов
     const displayRows = filteredData.slice(-60).reverse();
-
-    // КРИТИЧЕСКАЯ ОПТИМИЗАЦИЯ ПАМЯТИ: Собираем массив строк в одну операцию
-    // Запрещено делать tableBody.innerHTML += в цикле!
     const htmlChunks = [];
 
     for (let i = 0; i < displayRows.length; i++) {
@@ -424,10 +471,342 @@ function renderAnalytics(data) {
         `);
     }
 
-    // Ровно 1 запись в DOM вместо сотен вызовов парсера
     tableBody.innerHTML = htmlChunks.join("");
-
     lastRenderedTimestamp = data[data.length - 1].time;
+}
+
+// ==========================================================================
+// Мониторинг задержки шлюза / пинга
+// ==========================================================================
+
+function checkGatewayPing() {
+    const badge = document.getElementById('ping-result-badge');
+    const details = document.getElementById('ping-details-text');
+    const spinner = document.getElementById('ping-btn-spinner');
+
+    if (spinner) spinner.classList.remove('d-none');
+    if (badge) {
+        badge.className = "badge bg-secondary-subtle text-light rounded-pill px-2 py-1";
+        badge.innerText = "Измерение...";
+    }
+
+    fetch('/api/utils/wifi/ping?host=8.8.8.8')
+        .then(res => res.json())
+        .then(resp => {
+            if (spinner) spinner.classList.add('d-none');
+            if (!resp.alive) {
+                if (badge) {
+                    badge.className = "badge bg-danger-subtle text-danger rounded-pill px-2 py-1";
+                    badge.innerText = "Обрыв связи / Таймаут";
+                }
+                if (details) details.innerText = `Шлюз не отвечает (${new Date().toLocaleTimeString()})`;
+                return;
+            }
+
+            const ms = resp.latency_ms;
+            let statusBadgeClass = "badge bg-success-subtle text-success rounded-pill px-2 py-1";
+            let statusText = "Отлично";
+
+            if (ms > 120) {
+                statusBadgeClass = "badge bg-danger-subtle text-danger rounded-pill px-2 py-1";
+                statusText = "Высокая задержка";
+            } else if (ms > 50) {
+                statusBadgeClass = "badge bg-warning-subtle text-warning rounded-pill px-2 py-1";
+                statusText = "Удовлетворительно";
+            }
+
+            if (badge) {
+                badge.className = statusBadgeClass;
+                badge.innerText = `${ms} мс (${statusText})`;
+            }
+            if (details) {
+                details.innerText = `Шлюз 8.8.8.8 стабилен • Время проверки: ${new Date().toLocaleTimeString()}`;
+            }
+        })
+        .catch(err => {
+            if (spinner) spinner.classList.add('d-none');
+            if (badge) {
+                badge.className = "badge bg-danger-subtle text-danger rounded-pill px-2 py-1";
+                badge.innerText = "Ошибка проверки";
+            }
+        });
+}
+
+function toggleAutoPing(enabled) {
+    localStorage.setItem('wifi_auto_ping', enabled ? 'true' : 'false');
+    if (autoPingTimer) clearInterval(autoPingTimer);
+
+    if (enabled) {
+        checkGatewayPing();
+        autoPingTimer = setInterval(() => {
+            if (!document.hidden && !isPaused) {
+                checkGatewayPing();
+            }
+        }, 15000);
+        if (typeof showToast === 'function') {
+            showToast("Фоновый мониторинг задержки шлюза активирован (каждые 15 сек)", "info");
+        }
+    } else {
+        if (typeof showToast === 'function') {
+            showToast("Фоновый мониторинг задержки отключен", "info");
+        }
+    }
+}
+
+// ==========================================================================
+// Сканер зашумленности радиоэфира
+// ==========================================================================
+
+function performAirScan() {
+    const spinner = document.getElementById('scan-btn-spinner');
+    const tableBody = document.getElementById('scan-table-body');
+    const totalCountEl = document.getElementById('scan-total-count');
+
+    if (spinner) spinner.classList.remove('d-none');
+    if (tableBody) {
+        tableBody.innerHTML = `<tr><td colspan="7" class="text-center text-info py-4"><span class="spinner-border spinner-border-sm me-2"></span>Сканирование радиоэфира через netsh...</td></tr>`;
+    }
+
+    fetch('/api/utils/wifi/scan')
+        .then(res => res.json())
+        .then(data => {
+            if (spinner) spinner.classList.add('d-none');
+
+            // Рекомендация
+            const recTitle = document.getElementById('scan-rec-title');
+            const recDesc = document.getElementById('scan-rec-desc');
+            if (recTitle) recTitle.innerText = `Рекомендованный свободный канал 2.4 ГГц: Канал ${data.recommended_channel}`;
+            if (recDesc) {
+                recDesc.innerText = `Обнаружено точек: ${data.total_bssids}. Канал ${data.recommended_channel} имеет наименьшее количество конкурирующих роутеров вокруг вас. Время сканирования: ${data.scan_time}.`;
+            }
+
+            // Шкалы каналов 2.4 ГГц
+            renderCrowdBars('crowd-bars-24', data.channel_crowd_24, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], data.recommended_channel);
+
+            // Шкалы каналов 5 ГГц
+            renderCrowdBars('crowd-bars-5', data.channel_crowd_5, [36, 40, 44, 48, 52, 56, 149, 153, 157, 161], null);
+
+            // Таблица обнаруженных точек
+            if (totalCountEl) totalCountEl.innerText = data.total_bssids;
+
+            if (!data.networks || data.networks.length === 0) {
+                if (tableBody) tableBody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-4">Точки доступа вокруг не обнаружены.</td></tr>`;
+                return;
+            }
+
+            const rows = [];
+            data.networks.forEach(net => {
+                net.bssids.forEach(b => {
+                    const signalColor = b.signal >= 70 ? 'text-success' : (b.signal >= 40 ? 'text-warning' : 'text-danger');
+                    rows.push(`
+                        <tr>
+                            <td><strong class="text-white">${net.ssid || 'Скрытая сеть'}</strong></td>
+                            <td><code class="text-secondary">${b.bssid}</code></td>
+                            <td><span class="badge bg-secondary-subtle text-light">${b.channel}</span></td>
+                            <td><small class="text-muted">${b.band}</small></td>
+                            <td><strong class="${signalColor}">${b.signal}% (${b.signal_dbm} dBm)</strong></td>
+                            <td><small class="text-muted">${b.radio || '—'}</small></td>
+                            <td><small class="text-muted">${net.auth || '—'} / ${net.encrypt || '—'}</small></td>
+                        </tr>
+                    `);
+                });
+            });
+
+            if (tableBody) tableBody.innerHTML = rows.join("");
+            if (typeof showToast === 'function') {
+                showToast(`Радиоэфир просканирован! Найдено ${data.total_bssids} точек доступа.`, 'success');
+            }
+        })
+        .catch(err => {
+            if (spinner) spinner.classList.add('d-none');
+            if (tableBody) tableBody.innerHTML = `<tr><td colspan="7" class="text-center text-danger py-4">Ошибка сканирования сетей: ${err}</td></tr>`;
+        });
+}
+
+function renderCrowdBars(containerId, crowdMap, channels, recommendedCh) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    let maxCrowd = 1;
+    channels.forEach(ch => {
+        const count = crowdMap[ch] || 0;
+        if (count > maxCrowd) maxCrowd = count;
+    });
+
+    const html = channels.map(ch => {
+        const count = crowdMap[ch] || 0;
+        const pct = Math.min(100, Math.round((count / maxCrowd) * 100));
+        const isRec = ch === recommendedCh;
+        const barColor = isRec ? 'bg-success' : (count > 3 ? 'bg-danger' : (count > 0 ? 'bg-warning' : 'bg-secondary'));
+
+        return `
+            <div class="mb-2">
+                <div class="d-flex justify-content-between small">
+                    <span class="${isRec ? 'text-success fw-bold' : 'text-light'}">Канал ${ch} ${isRec ? '★ (Свободный)' : ''}</span>
+                    <span class="text-muted">${count} сетей</span>
+                </div>
+                <div class="channel-bar-container">
+                    <div class="channel-bar-fill ${barColor}" style="width: ${count > 0 ? Math.max(8, pct) : 0}%;"></div>
+                </div>
+            </div>
+        `;
+    }).join("");
+
+    container.innerHTML = html;
+}
+
+// ==========================================================================
+// Детектор подмены точек доступа (Сумматор BSSID и аномалий)
+// ==========================================================================
+
+function analyzeApRegistryAndSecurity() {
+    if (!cachedLogData || cachedLogData.length === 0) {
+        document.getElementById('security-registry-table-body').innerHTML = `<tr><td colspan="7" class="text-center text-muted py-4">Журнал телеметрии пуст — запустите сбор данных.</td></tr>`;
+        return;
+    }
+
+    const ssidRegistry = {};
+    const anomalies = [];
+    let lastSeenSsid = "";
+    let lastSeenBssid = "";
+
+    // Суммируем исторические данные
+    cachedLogData.forEach(entry => {
+        const ssid = entry.ssid;
+        const bssid = entry.bssid;
+        if (!ssid || ssid === "Disconnected" || !bssid || bssid === "--:--:--:--:--:--") {
+            lastSeenSsid = "";
+            lastSeenBssid = "";
+            return;
+        }
+
+        // Детекция переключения точки в рамках одной сети
+        if (lastSeenSsid === ssid && lastSeenBssid && lastSeenBssid !== bssid) {
+            anomalies.push({
+                time: entry.time,
+                ssid: ssid,
+                prevBssid: lastSeenBssid,
+                newBssid: bssid
+            });
+        }
+        lastSeenSsid = ssid;
+        lastSeenBssid = bssid;
+
+        if (!ssidRegistry[ssid]) {
+            ssidRegistry[ssid] = {
+                bssids: new Set(),
+                channels: new Set(),
+                count: 0,
+                signalSum: 0,
+                firstTime: entry.time,
+                lastTime: entry.time
+            };
+        }
+
+        const rec = ssidRegistry[ssid];
+        rec.bssids.add(bssid);
+        if (entry.channel > 0) rec.channels.add(entry.channel);
+        rec.count++;
+        rec.signalSum += entry.signal;
+        rec.lastTime = entry.time;
+    });
+
+    const uniqueSsids = Object.keys(ssidRegistry);
+    let totalUniqueBssids = 0;
+    uniqueSsids.forEach(s => totalUniqueBssids += ssidRegistry[s].bssids.size);
+
+    const elUssids = document.getElementById('sec-unique-ssids');
+    const elUbssids = document.getElementById('sec-unique-bssids');
+    const elAnomalies = document.getElementById('sec-anomaly-count');
+
+    if (elUssids) elUssids.innerText = uniqueSsids.length;
+    if (elUbssids) elUbssids.innerText = totalUniqueBssids;
+    if (elAnomalies) elAnomalies.innerText = anomalies.length;
+
+    // Заполняем таблицу реестра сетей
+    const regTableBody = document.getElementById('security-registry-table-body');
+    const regRows = [];
+
+    uniqueSsids.forEach(ssid => {
+        const info = ssidRegistry[ssid];
+        const bssidList = Array.from(info.bssids);
+        const channelList = Array.from(info.channels).join(", ") || "—";
+        const avgSig = Math.round(info.signalSum / info.count);
+
+        let statusBadge = `<span class="badge bg-success-subtle text-success">Одна точка (Стабильно)</span>`;
+        if (bssidList.length > 1) {
+            statusBadge = `<span class="badge badge-mesh">Множественные точки (${bssidList.length})</span>`;
+        }
+
+        const bssidDisplay = bssidList.map(b => `<code class="text-info d-inline-block me-2">${b}</code>`).join("");
+
+        regRows.push(`
+            <tr>
+                <td><strong class="text-white">${ssid}</strong></td>
+                <td>${bssidDisplay}</td>
+                <td><span class="badge bg-secondary-subtle text-light">${channelList}</span></td>
+                <td>${info.count}</td>
+                <td><small class="text-muted">${info.firstTime} → ${info.lastTime}</small></td>
+                <td><strong class="${avgSig >= -65 ? 'text-success' : 'text-warning'}">${avgSig} dBm</strong></td>
+                <td>${statusBadge}</td>
+            </tr>
+        `);
+    });
+
+    if (regTableBody) {
+        regTableBody.innerHTML = regRows.length > 0 ? regRows.join("") : `<tr><td colspan="7" class="text-center text-muted py-4">Данные сетей отсутствуют.</td></tr>`;
+    }
+
+    // Заполняем хронологию инцидентов / смены точек
+    const anomTableBody = document.getElementById('security-anomalies-table-body');
+    if (anomTableBody) {
+        if (anomalies.length === 0) {
+            anomTableBody.innerHTML = `<tr><td colspan="5" class="text-center text-success py-4">✓ Подмен или внезапных переключений точек доступа не зафиксировано. Все сети стабильны.</td></tr>`;
+        } else {
+            const anomRows = [...anomalies].reverse().map(anom => `
+                <tr>
+                    <td><code>${anom.time}</code></td>
+                    <td><strong class="text-white">${anom.ssid}</strong></td>
+                    <td><code class="text-secondary">${anom.prevBssid}</code></td>
+                    <td><code class="text-warning">${anom.newBssid}</code></td>
+                    <td><span class="badge badge-rogue-warning">⚠️ Переключение BSSID (Роуминг / Смена точки)</span></td>
+                </tr>
+            `);
+            anomTableBody.innerHTML = anomRows.join("");
+        }
+    }
+}
+
+// Очистка логов модуля
+function clearWifiLogs() {
+    const rawId = new URLSearchParams(window.location.search).get('id') || "WIFI";
+    if (confirm("Вы уверены, что хотите полностью очистить журнал телеметрии Wi-Fi? Это действие необратимо.")) {
+        fetch(`/api/utils/logs/clear?id=${encodeURIComponent(rawId.toUpperCase())}`, { method: 'POST' })
+            .then(res => {
+                if (res.ok) {
+                    if (typeof showToast === 'function') {
+                        showToast("Журнал телеметрии успешно очищен!", 'info');
+                    } else {
+                        alert("Журнал успешно очищен!");
+                    }
+                    cachedLogData = [];
+                    lastRenderedTimestamp = "";
+                    renderAnalytics([]);
+                    analyzeApRegistryAndSecurity();
+                    const sizeBadge = document.getElementById("log-size-badge");
+                    if (sizeBadge) sizeBadge.innerText = "0 КБ";
+                } else {
+                    if (typeof showToast === 'function') {
+                        showToast("Не удалось очистить журнал.", 'danger');
+                    } else {
+                        alert("Ошибка очистки журнала.");
+                    }
+                }
+            })
+            .catch(err => {
+                alert("Ошибка сети: " + err);
+            });
+    }
 }
 
 // Управление отображением графика
@@ -528,7 +907,8 @@ function saveWifiSettings() {
     const id = new URLSearchParams(window.location.search).get('id') || "WIFI";
     const newSettings = {
         interval_sec: document.getElementById("cfg_live_interval_sec") ? document.getElementById("cfg_live_interval_sec").value : "5",
-        min_signal_drop_dbm: document.getElementById("cfg_live_min_signal_drop_dbm") ? document.getElementById("cfg_live_min_signal_drop_dbm").value : "5"
+        min_signal_drop_dbm: document.getElementById("cfg_live_min_signal_drop_dbm") ? document.getElementById("cfg_live_min_signal_drop_dbm").value : "5",
+        max_log_mb: document.getElementById("cfg_live_max_log_mb") ? document.getElementById("cfg_live_max_log_mb").value : "5"
     };
 
     fetch(`/api/utils/save?id=${encodeURIComponent(id)}`, {
