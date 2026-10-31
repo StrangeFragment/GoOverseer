@@ -1,3 +1,41 @@
+<!-- Блок живых карточек экспресс-аналитики вместо старого текста описания -->
+<div class="row row-cols-1 row-cols-md-4 g-3 mb-4">
+    <div class="col">
+        <div class="card bg-body-tertiary border-secondary-subtle shadow-sm h-100">
+            <div class="card-body py-3">
+                <h6 class="text-uppercase text-muted small fw-bold mb-1">Текущая сеть (SSID)</h6>
+                <h4 class="mb-0 fw-bold text-truncate" id="card-ssid">—</h4>
+            </div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card bg-body-tertiary border-secondary-subtle shadow-sm h-100">
+            <div class="card-body py-3">
+                <h6 class="text-uppercase text-muted small fw-bold mb-1">Точка доступа (BSSID)</h6>
+                <h4 class="mb-0 fw-bold text-truncate text-monospace small" id="card-bssid">—</h4>
+            </div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card bg-body-tertiary border-secondary-subtle shadow-sm h-100">
+            <div class="card-body py-3">
+                <h6 class="text-uppercase text-muted small fw-bold mb-1">Канал радиоэфира</h6>
+                <h4 class="mb-0 fw-bold text-primary" id="card-channel">—</h4>
+            </div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card bg-body-tertiary border-secondary-subtle shadow-sm h-100">
+            <div class="card-body py-3">
+                <h6 class="text-uppercase text-muted small fw-bold mb-1">Уровень сигнала</h6>
+                <h4 class="mb-0 fw-bold" id="card-signal">—</h4>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+
 <!-- Навигация по вкладкам Wi-Fi строго по стандарту Bootstrap 5 -->
 <ul class="nav nav-tabs mb-4" id="wifiTab" role="tablist">
   <li class="nav-item" role="presentation">

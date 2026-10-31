@@ -3,32 +3,31 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{.Name}} - Аналитика</title>
+    <title>GoOverseer Панель</title>
     <link rel="icon" type="image/png" href="/static/assets/overseer.png">
-    
-    <!-- Локальные стили -->
     <link rel="stylesheet" href="/static/css/bootstrap.min.css">
     <link rel="stylesheet" href="/static/css/app.css">
-    
-    <!-- ИСПРАВЛЕНО: Подключаем наш новый монолитный Chart.js UMD -->
-    <script src="/static/js/chart.min.js"></script>
 </head>
 <body>
+    <!-- Верхняя навигационная панель -->
     <nav class="navbar navbar-expand-lg navbar-dark bg-body-tertiary border-bottom border-translucent">
         <div class="container">
-            <a class="btn btn-outline-secondary btn-sm" href="/">◀ Назад к модулям</a>
-            <span class="navbar-text ms-auto text-light fw-bold">Модуль: {{.Name}}</span>
+            <a class="navbar-brand d-flex align-items-center" href="/">
+                <img src="/static/assets/overseer.png" alt="Logo" width="30" height="30" class="d-inline-block align-text-top me-2">
+                <strong>GoOverseer</strong>
+            </a>
+             <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+                <span class="navbar-text">
+                    <b>{{.Name}}.</b>&nbsp;{{.Description}}
+                </span>
+             </ul>
+            <button onclick="shutdownServer()" class="btn btn-outline-danger btn-sm">
+                Выгрузить оркестратор
+            </button>
         </div>
     </nav>
 
     <div class="container my-5">
-        <div class="row mb-4">
-            <div class="col">
-                <h1 class="fw-bold">{{.Name}}</h1>
-                <p class="text-muted">{{.Description}}</p>
-            </div>
-        </div>
-
         <div class="row">
             <div class="col-12">
                 {{.CustomHTML}} <!-- Сюда Go вклеит табы со склада -->

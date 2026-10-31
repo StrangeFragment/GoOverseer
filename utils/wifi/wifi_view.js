@@ -45,8 +45,11 @@ function initWifiChart() {
     });
 }
 
+
 function refreshWifiAnalytics() {
-    const id = new URLSearchParams(window.location.search).get('id');
+    // Считываем id и СРАЗУ переводим его в нижний регистр ("WIFI" -> "wifi")
+    const rawId = new URLSearchParams(window.location.search).get('id');
+    const id = rawId ? rawId.toLowerCase() : "wifi";
 
     // Отрисовка полей конфигурации
     const fieldsContainer = document.getElementById("wifi-custom-config-fields");
@@ -79,19 +82,49 @@ function refreshWifiAnalytics() {
         .then(data => {
             if (data.length > 0) {
                 const latestEntry = data[data.length - 1];
-                if (latestEntry.time !== lastRenderedTimestamp) {
+                // Рендерим, если пришло новое время ИЛИ если это самый первый запуск страницы
+                if (latestEntry.time !== lastRenderedTimestamp || lastRenderedTimestamp === "") {
                     renderAnalytics(data);
                 }
             } else {
                 renderAnalytics([]);
             }
         });
+
 }
 
 function renderAnalytics(data) {
     const tableBody = document.getElementById("wifi-log-table-body");
     if (!tableBody || !wifiChartInstance) return;
     
+    // === АБСОЛЮТНО БЕЗОПАСНОЕ ОБНОВЛЕНИЕ КАРТОЧЕК ===
+    if (data && data.length > 0) {
+        const latestEntry = data[data.length - 1];
+        
+        const elSsid = document.getElementById("card-ssid");
+        const elBssid = document.getElementById("card-bssid");
+        const elChannel = document.getElementById("card-channel");
+        const elSignal = document.getElementById("card-signal");
+
+        if (elSsid) elSsid.innerText = latestEntry.ssid || "Disconnected";
+        if (elBssid) elBssid.innerText = latestEntry.bssid || "—";
+        if (elChannel) elChannel.innerText = latestEntry.channel ?? "—";
+        
+        if (elSignal) {
+            elSignal.innerText = `${latestEntry.signal ?? -100} dBm`;
+            elSignal.className = "mb-0 fw-bold"; // Сброс
+            if (latestEntry.ssid === "Disconnected") {
+                elSignal.classList.add("text-danger");
+            } else if (latestEntry.signal >= -65) {
+                elSignal.classList.add("text-success");
+            } else {
+                elSignal.classList.add("text-warning");
+            }
+        }
+    }
+    // ===============================================
+
+
     tableBody.innerHTML = "";
 
     if (data.length === 0) {
