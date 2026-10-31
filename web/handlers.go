@@ -16,10 +16,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 
 	"GoOverseer/utils"
 
 	"golang.org/x/sys/windows/registry"
+	"golang.org/x/text/encoding/charmap"
 )
 
 type UtilitySchema struct {
@@ -43,8 +46,7 @@ type UtilityInfo struct {
 }
 
 // ReadUtilFile пытается прочитать файл модуля сначала с локального диска utils/ (режим разработки),
-// а если файл на диске отсутствует — читает его из встроенной файловой системы utils.EmbeddedFS
-// (режим автономного запуска с флешки из одного .exe файла).
+// а если файл на диске отсутствует — читает его из встроенной файловой системы utils.EmbeddedFS.
 func ReadUtilFile(subDir string, filename string) ([]byte, error) {
 	diskPath := filepath.Join("utils", strings.ToLower(subDir), filename)
 	if data, err := os.ReadFile(diskPath); err == nil {
@@ -188,7 +190,9 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		_, _ = w.Write(jsonResponse)
 	})
 
-	// Активация модуля
+	// Активация модуля:
+	// Получает или компилирует исполняемый файл демона, копирует в %APPDATA%\GoOverseer\<ID>,
+	// генерирует config.json, регистрирует в автозагрузке Windows и запускает фоновый процесс.
 	mux.HandleFunc("POST /api/utils/activate", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		if id == "" {
@@ -210,12 +214,7 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 			return
 		}
 
-		exeBytes, err := ReadUtilFile(strings.ToLower(target.ID), target.ExeName)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Бинарник %s модуля %s не найден (возможно, еще не скомпилирован): %v", target.ExeName, target.ID, err), http.StatusBadRequest)
-			return
-		}
-
+		// 1. Создаем рабочую папку модуля в %APPDATA%\GoOverseer\<ID>
 		appDataDir, _ := os.UserConfigDir()
 		liveDir := filepath.Join(appDataDir, "GoOverseer", target.ID)
 		if err := os.MkdirAll(liveDir, 0755); err != nil {
@@ -224,11 +223,32 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		}
 
 		dstExe := filepath.Join(liveDir, target.ExeName)
-		if err := os.WriteFile(dstExe, exeBytes, 0755); err != nil {
-			http.Error(w, "Ошибка записи бинарника в AppData: "+err.Error(), http.StatusInternalServerError)
-			return
+
+		// 2. Получаем исполняемый файл демона
+		exeBytes, err := ReadUtilFile(strings.ToLower(target.ID), target.ExeName)
+		if err == nil {
+			if writeErr := os.WriteFile(dstExe, exeBytes, 0755); writeErr != nil {
+				http.Error(w, "Ошибка записи бинарника в AppData: "+writeErr.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// Если скомпилированного .exe нет на диске (или он заблокирован антивирусом),
+			// автоматически собираем демон из исходников .go прямо в целевую папку AppData!
+			srcGoDisk := filepath.Join("utils", strings.ToLower(target.ID), strings.ToLower(target.ID)+"_worker.go")
+			if _, statErr := os.Stat(srcGoDisk); statErr == nil {
+				buildCmd := exec.Command("go", "build", "-trimpath", "-ldflags", "-s -w -H windowsgui", "-o", dstExe, srcGoDisk)
+				buildCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+				if buildErr := buildCmd.Run(); buildErr != nil {
+					http.Error(w, fmt.Sprintf("Бинарник %s отсутствует, а сборка из %s завершилась с ошибкой: %v", target.ExeName, srcGoDisk, buildErr), http.StatusBadRequest)
+					return
+				}
+			} else {
+				http.Error(w, fmt.Sprintf("Исполняемый файл %s для модуля %s не найден", target.ExeName, target.ID), http.StatusBadRequest)
+				return
+			}
 		}
 
+		// 3. Создаем конфигурационный файл config.json
 		defaultSettings := make(map[string]string)
 		for _, schema := range target.UISchema {
 			defaultSettings[schema.Key] = schema.Default
@@ -236,12 +256,14 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		cfgData, _ := json.MarshalIndent(defaultSettings, "", "  ")
 		_ = os.WriteFile(filepath.Join(liveDir, "config.json"), cfgData, 0644)
 
+		// 4. Прописываем в автозагрузку Windows
 		k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 		if err == nil {
 			_ = k.SetStringValue("GoOverseer_"+target.ID, dstExe)
 			k.Close()
 		}
 
+		// 5. Запускаем процесс демона в скрытом режиме с рабочей директорией в AppData
 		cmd := exec.Command(dstExe)
 		cmd.Dir = liveDir
 		cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -255,7 +277,8 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 		_, _ = w.Write([]byte("Activated successfully"))
 	})
 
-	// Деактивация модуля
+	// Деактивация модуля:
+	// Принудительно гасит процесс, стирает ключ из реестра Windows и полностью зачищает папку в AppData.
 	mux.HandleFunc("POST /api/utils/deactivate", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		if id == "" {
@@ -277,16 +300,19 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 			return
 		}
 
+		// 1. Принудительно завершаем процесс и все его дочерние процессы без мигания консоли
 		killCmd := exec.Command("taskkill", "/F", "/T", "/IM", target.ExeName)
 		killCmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		_ = killCmd.Run()
 
+		// 2. Удаляем ключ из автозагрузки Windows
 		k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
 		if err == nil {
 			_ = k.DeleteValue("GoOverseer_" + target.ID)
 			k.Close()
 		}
 
+		// 3. Зачищаем все файлы и папку модуля из %APPDATA%\GoOverseer\<ID>
 		appDataDir, _ := os.UserConfigDir()
 		liveDir := filepath.Join(appDataDir, "GoOverseer", target.ID)
 
@@ -494,6 +520,10 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 	// Сканирование эфира и соседних сетей Wi-Fi
 	mux.HandleFunc("GET /api/utils/wifi/scan", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// Принудительно вызываем активное аппаратное сканирование (Probe Request) через Native Wifi API,
+		// чтобы Windows обновила внутренний кэш окружающих сетей (как при открытии трея).
+		triggerWlanScan()
+
 		res, err := scanSurroundingWifi()
 		if err != nil {
 			http.Error(w, "Ошибка сканирования сетей: "+err.Error(), http.StatusInternalServerError)
@@ -559,6 +589,95 @@ func SetupHandlers(shutdownCtxCancel func()) *http.ServeMux {
 	return mux
 }
 
+// Windows Native Wifi API (wlanapi.dll) для принудительного аппаратного сканирования эфира
+var (
+	wlanapi            = syscall.NewLazyDLL("wlanapi.dll")
+	wlanOpenHandle     = wlanapi.NewProc("WlanOpenHandle")
+	wlanEnumInterfaces = wlanapi.NewProc("WlanEnumInterfaces")
+	wlanScan           = wlanapi.NewProc("WlanScan")
+	wlanFreeMemory     = wlanapi.NewProc("WlanFreeMemory")
+	wlanCloseHandle    = wlanapi.NewProc("WlanCloseHandle")
+)
+
+// triggerWlanScan посылает Wi-Fi адаптеру команду активного сканирования (Probe Request на всех частотах).
+// В фоновом режиме Windows не опрашивает эфир для экономии батареи и ресурсов, пока пользователь
+// не откроет трей или программа не вызовет WlanScan.
+func triggerWlanScan() {
+	var negotiatedVersion uint32
+	var clientHandle uintptr
+
+	r1, _, _ := wlanOpenHandle.Call(2, 0, uintptr(unsafe.Pointer(&negotiatedVersion)), uintptr(unsafe.Pointer(&clientHandle)))
+	if r1 != 0 {
+		return
+	}
+	defer wlanCloseHandle.Call(clientHandle, 0)
+
+	var pInterfaceList uintptr
+	r1, _, _ = wlanEnumInterfaces.Call(clientHandle, 0, uintptr(unsafe.Pointer(&pInterfaceList)))
+	if r1 != 0 || pInterfaceList == 0 {
+		return
+	}
+	defer wlanFreeMemory.Call(pInterfaceList)
+
+	dwNumberOfItems := *(*uint32)(unsafe.Pointer(pInterfaceList))
+	if dwNumberOfItems == 0 {
+		return
+	}
+
+	// Структура WLAN_INTERFACE_INFO (532 байта): GUID (16) + Desc (512) + State (4)
+	base := pInterfaceList + 8
+	for i := uint32(0); i < dwNumberOfItems; i++ {
+		guidPtr := base + uintptr(i*532)
+		_, _, _ = wlanScan.Call(clientHandle, guidPtr, 0, 0, 0)
+	}
+
+	// Ожидаем 1.5 секунды, пока радиомодуль переключает каналы и принимает Beacon-фреймы
+	time.Sleep(1500 * time.Millisecond)
+}
+
+// getWifiDriverInfo проверяет физические возможности адаптера (поддержка 5 ГГц / стандарты 802.11)
+func getWifiDriverInfo() (supports5GHz bool, radioTypes string) {
+	cmd := exec.Command("netsh", "wlan", "show", "drivers")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, err := cmd.Output()
+	if err != nil {
+		return false, ""
+	}
+
+	var rawStr string
+	if utf8.Valid(out) {
+		rawStr = string(out)
+	} else {
+		decoder := charmap.CodePage866.NewDecoder()
+		utf8Bytes, decErr := decoder.Bytes(out)
+		if decErr == nil {
+			rawStr = string(utf8Bytes)
+		} else {
+			rawStr = string(out)
+		}
+	}
+
+	lines := strings.Split(rawStr, "\n")
+	for _, line := range lines {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		if strings.Contains(k, "Поддерживаемые типы радиомодулей") || strings.Contains(k, "Radio types supported") {
+			radioTypes = v
+			lower := strings.ToLower(v)
+			// Стандарты 802.11a, 802.11ac, 802.11ax, 802.11be работают на 5 ГГц и выше
+			if strings.Contains(lower, "802.11a") || strings.Contains(lower, "802.11ac") || strings.Contains(lower, "802.11ax") || strings.Contains(lower, "802.11be") {
+				supports5GHz = true
+			}
+			break
+		}
+	}
+	return
+}
+
 // Структура для результатов сканирования соседних сетей Wi-Fi
 type ScannedBSSID struct {
 	BSSID     string `json:"bssid"`
@@ -577,12 +696,15 @@ type ScannedNetwork struct {
 }
 
 type ScanResult struct {
-	Networks           []ScannedNetwork `json:"networks"`
-	ChannelCrowd24     map[int]int      `json:"channel_crowd_24"`
-	ChannelCrowd5      map[int]int      `json:"channel_crowd_5"`
-	RecommendedChannel int              `json:"recommended_channel"`
-	TotalBSSIDs        int              `json:"total_bssids"`
-	ScanTime           string           `json:"scan_time"`
+	Networks            []ScannedNetwork `json:"networks"`
+	ChannelCrowd24      map[int]int      `json:"channel_crowd_24"`
+	ChannelCrowd5       map[int]int      `json:"channel_crowd_5"`
+	RecommendedChannel  int              `json:"recommended_channel"`
+	RecommendedChannel5 int              `json:"recommended_channel_5"`
+	TotalBSSIDs         int              `json:"total_bssids"`
+	ScanTime            string           `json:"scan_time"`
+	Supports5GHz        bool             `json:"supports_5ghz"`
+	RadioTypes          string           `json:"radio_types"`
 }
 
 // Парсер вывода netsh wlan show networks mode=bssid
@@ -598,11 +720,30 @@ func scanSurroundingWifi() (ScanResult, error) {
 		ScanTime:       time.Now().Format("15:04:05"),
 	}
 
+	// Считываем физические возможности драйвера адаптера
+	supp5, rTypes := getWifiDriverInfo()
+	res.Supports5GHz = supp5
+	res.RadioTypes = rTypes
+
 	if err != nil {
 		return res, err
 	}
 
-	lines := strings.Split(string(out), "\n")
+	// Декодируем OEM CP866 вывод Windows консоли
+	var rawStr string
+	if utf8.Valid(out) {
+		rawStr = string(out)
+	} else {
+		decoder := charmap.CodePage866.NewDecoder()
+		utf8Bytes, decErr := decoder.Bytes(out)
+		if decErr == nil {
+			rawStr = string(utf8Bytes)
+		} else {
+			rawStr = string(out)
+		}
+	}
+
+	lines := strings.Split(rawStr, "\n")
 	var currentNet *ScannedNetwork
 	var currentBSSID *ScannedBSSID
 
@@ -623,6 +764,7 @@ func scanSurroundingWifi() (ScanResult, error) {
 			if currentNet != nil {
 				if currentBSSID != nil {
 					currentNet.BSSIDs = append(currentNet.BSSIDs, *currentBSSID)
+					res.TotalBSSIDs++
 					currentBSSID = nil
 				}
 				res.Networks = append(res.Networks, *currentNet)
@@ -646,11 +788,12 @@ func scanSurroundingWifi() (ScanResult, error) {
 		case strings.HasPrefix(k, "BSSID "):
 			if currentBSSID != nil {
 				currentNet.BSSIDs = append(currentNet.BSSIDs, *currentBSSID)
+				res.TotalBSSIDs++
 			}
 			currentBSSID = &ScannedBSSID{BSSID: v}
 		case strings.Contains(k, "Сигнал") || strings.Contains(k, "Signal"):
 			if currentBSSID != nil {
-				val := strings.TrimSuffix(v, "%")
+				val := strings.TrimSpace(strings.TrimSuffix(v, "%"))
 				pct, _ := strconv.Atoi(val)
 				currentBSSID.Signal = pct
 				currentBSSID.SignalDbm = (pct / 2) - 100
@@ -661,7 +804,7 @@ func scanSurroundingWifi() (ScanResult, error) {
 			}
 		case strings.Contains(k, "Канал") || strings.Contains(k, "Channel"):
 			if currentBSSID != nil {
-				ch, _ := strconv.Atoi(v)
+				ch, _ := strconv.Atoi(strings.TrimSpace(v))
 				currentBSSID.Channel = ch
 				if ch >= 1 && ch <= 14 {
 					currentBSSID.Band = "2.4 GHz"
@@ -670,7 +813,6 @@ func scanSurroundingWifi() (ScanResult, error) {
 					currentBSSID.Band = "5 GHz"
 					res.ChannelCrowd5[ch]++
 				}
-				res.TotalBSSIDs++
 			}
 		}
 	}
@@ -678,11 +820,12 @@ func scanSurroundingWifi() (ScanResult, error) {
 	if currentNet != nil {
 		if currentBSSID != nil {
 			currentNet.BSSIDs = append(currentNet.BSSIDs, *currentBSSID)
+			res.TotalBSSIDs++
 		}
 		res.Networks = append(res.Networks, *currentNet)
 	}
 
-	// Выбираем наименее загруженный канал из классической тройки 2.4 ГГц (1, 6, 11)
+	// Выбираем наименее загруженный канал в 2.4 ГГц из непересекающихся (1, 6, 11)
 	best24 := 1
 	minCrowd := 999
 	for _, ch := range []int{1, 6, 11} {
@@ -693,6 +836,18 @@ func scanSurroundingWifi() (ScanResult, error) {
 		}
 	}
 	res.RecommendedChannel = best24
+
+	// В 5 ГГц
+	best5 := 36
+	minCrowd5 := 999
+	for _, ch := range []int{36, 40, 44, 48, 149, 153, 157, 161} {
+		crowd := res.ChannelCrowd5[ch]
+		if crowd < minCrowd5 {
+			minCrowd5 = crowd
+			best5 = ch
+		}
+	}
+	res.RecommendedChannel5 = best5
 
 	return res, nil
 }
